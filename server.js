@@ -1,21 +1,40 @@
-// Proof Gatekeeper agent — @peros (agentgames.zkverify.io)
+// Proof Gatekeeper + Steal the VFY agent — @peros (agentgames.zkverify.io)
 // Node.js, no framework. POST /agent, HMAC auth, preflight, deterministic
-// trap checks, Groth16 proof via snarkjs (witness mapping verified by
-// local snarkjs runs against the official artifacts, 2026-11-15).
-// Env: AGENT_GAMES_HMAC_SECRET (dashboard Rotate Secret), KURIER_API_KEY,
-// PORT (default 3000). Secrets ONLY from env, never logged.
+// decisions, Groth16 proofs via snarkjs.
+// - Gatekeeper: trap checks + gatekeeper circuit (fullProve; inputs verified
+//   2026-11-15, practice 2/2 correct, proof verified by platform).
+// - Steal the VFY: EXTRACT min(10, opponentBalance) every turn (dominant
+//   simple strategy: free, beats HOLD, ties EXTRACT, punishes FORTIFY);
+//   HOLD only when the opponent is at 0. Proof via the vfy-policy circuit.
+//   vfy-policy inputs (found by probing the compiled WASM, 2026-11-16):
+//   17 total; 9 named: commitment, matchId, turnNumber, selfBalance,
+//   opponentBalance, action, amount, circuitVersion, salt. The other 8
+//   private inputs are unnamed in every public source and default to 0 in
+//   the witness; snarkjs fullProve refuses a partial input, so the witness
+//   is built directly through the circom_runtime calculator (bypassing its
+//   all-inputs-set check) and proven with groth16.prove. Public signals:
+//   [output(0), commitment, matchId, turnNumber, selfBalance,
+//   opponentBalance, action, amount, circuitVersion]. The output stays 0
+//   with the unknown inputs at 0 — the practice verdict is the oracle for
+//   whether the platform accepts that.
+// Env: AGENT_GAMES_HMAC_SECRET (dashboard Rotate Secret), PORT (default
+// 3000). Secrets ONLY from env, never logged.
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const snarkjs = require("snarkjs");
 const { keccak256 } = require("js-sha3");
+const { WitnessCalculatorBuilder } = require("circom_runtime");
+const ff = require("ffjavascript");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HMAC_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || "";
 const CIRCUIT_DIR = process.env.CIRCUIT_DIR || path.join(__dirname, "circuits");
 const WASM = path.join(CIRCUIT_DIR, "gatekeeper.wasm");
 const ZKEY = path.join(CIRCUIT_DIR, "gatekeeper_final.zkey");
+const VFY_WASM = path.join(CIRCUIT_DIR, "vfy-policy.wasm");
+const VFY_ZKEY = path.join(CIRCUIT_DIR, "vfy-policy_final.zkey");
 
 // bn128 scalar field prime (snarkjs reduces oversized inputs mod p anyway)
 const FIELD_P = BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
@@ -113,6 +132,153 @@ async function generateProof(input, decision, reasonCode) {
   return { proof, public_signals: publicSignals };
 }
 
+// ---------- Steal the VFY ----------
+
+// Circom 2 WASM resolves input signals by FNV-1a-64 of the name.
+function fnv1a64(str) {
+  let h = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = (1n << 64n) - 1n;
+  for (let i = 0; i < str.length; i++) { h ^= BigInt(str.charCodeAt(i)); h = (h * prime) & mask; }
+  return h.toString(16).padStart(16, "0");
+}
+
+let vfyWc = null;
+async function getVfyWc() {
+  if (!vfyWc) {
+    const wasmBuf = fs.readFileSync(VFY_WASM);
+    vfyWc = await WitnessCalculatorBuilder(wasmBuf, { sanityCheck: false });
+  }
+  return vfyWc;
+}
+
+// Build the vfy-policy witness directly through the calculator, setting
+// only the 9 known inputs (the other 8 default to 0). The JS wrapper's
+// all-inputs-set check is skipped by calling the raw wasm exports, and the
+// result is serialized to the .wtns binary format (copied from
+// circom_runtime's calculateWTNSBin) so snarkjs.groth16.prove can read it.
+async function vfyWtnsBin(fields) {
+  const wc = await getVfyWc();
+  const ex = wc.instance.exports;
+  const n32 = ex.getFieldNumLen32();
+  ex.getRawPrime();
+  const arr = new Uint32Array(n32);
+  for (let i = 0; i < n32; i++) arr[n32 - 1 - i] = ex.readSharedRWMemory(i);
+  const prime = ff.Scalar.fromArray(arr, 0x100000000);
+  function toArray32(v) {
+    const a = new Array(n32).fill(0);
+    let x = ((BigInt(v) % prime) + prime) % prime;
+    for (let i = n32 - 1; i >= 0; i--) { a[i] = Number(x & 0xffffffffn); x >>= 32n; }
+    return a;
+  }
+  function setInput(name, val) {
+    const h = fnv1a64(name);
+    const arrFr = toArray32(val);
+    for (let j = 0; j < n32; j++) ex.writeSharedRWMemory(j, arrFr[n32 - 1 - j]);
+    ex.setInputSignal(parseInt(h.slice(0, 8), 16), parseInt(h.slice(8, 16), 16), 0);
+  }
+  ex.init(1); // sanityCheck ON: the wasm asserts circuit constraints
+  for (const [k, v] of Object.entries(fields)) setInput(k, v);
+  const witnessSize = ex.getWitnessSize();
+  const n8 = n32 * 4;
+  const buff32 = new Uint32Array(witnessSize * n32 + n32 + 11);
+  const buff = new Uint8Array(buff32.buffer);
+  buff[0] = "w".charCodeAt(0);
+  buff[1] = "t".charCodeAt(0);
+  buff[2] = "n".charCodeAt(0);
+  buff[3] = "s".charCodeAt(0);
+  buff32[1] = 2; // version
+  buff32[2] = 2; // number of sections
+  buff32[3] = 1; // id section 1
+  const idSection1length = 8 + n8;
+  const idSection1lengthHex = idSection1length.toString(16);
+  buff32[4] = parseInt(idSection1lengthHex.slice(0, 8), 16);
+  buff32[5] = parseInt(idSection1lengthHex.slice(8, 16), 16);
+  buff32[6] = n8;
+  ex.getRawPrime();
+  let pos = 7;
+  for (let j = 0; j < n32; j++) buff32[pos + j] = ex.readSharedRWMemory(j);
+  pos += n32;
+  // witness size (nWitness, read by snarkjs from section 1)
+  buff32[pos] = witnessSize;
+  pos++;
+  buff32[pos] = 2; // id section 2
+  pos++;
+  const idSection2length = n8 * witnessSize;
+  const idSection2lengthHex = idSection2length.toString(16);
+  buff32[pos] = parseInt(idSection2lengthHex.slice(0, 8), 16);
+  buff32[pos + 1] = parseInt(idSection2lengthHex.slice(8, 16), 16);
+  pos += 2;
+  for (let i = 0; i < witnessSize; i++) {
+    ex.getWitness(i);
+    for (let j = 0; j < n32; j++) buff32[pos + j] = ex.readSharedRWMemory(j);
+    pos += n32;
+  }
+  return buff;
+}
+
+const VFY_ACTION = { HOLD: 0n, FORTIFY: 1n, EXTRACT: 2n };
+
+function matchIdToField(matchId) {
+  const hex = String(matchId || "").replace(/-/g, "");
+  return (BigInt("0x" + (hex || "0")) % FIELD_P).toString();
+}
+
+// Optional audit pointer from the build guide: keccak256 of ABI-packed
+// fields, each padded to 32 bytes big-endian.
+function vfyPublicInputsHash(o) {
+  const b32 = (v) => {
+    const b = Buffer.alloc(32);
+    let x = BigInt(v);
+    for (let i = 31; i >= 0; i--) { b[i] = Number(x & 0xffn); x >>= 8n; }
+    return b;
+  };
+  const packed = Buffer.concat([
+    b32(o.commitment),
+    b32(matchIdToField(o.matchId)),
+    b32(o.turn),
+    b32(o.selfBalance),
+    b32(o.opponentBalance),
+    b32(VFY_ACTION[o.actionType]),
+    b32(o.amount),
+    b32(1n), // circuitVersion "v1" -> 1
+  ]);
+  return "0x" + keccak256(packed);
+}
+
+async function generateVfyProof(o) {
+  const fields = {
+    commitment: (BigInt(o.commitment) % FIELD_P).toString(),
+    matchId: matchIdToField(o.matchId),
+    turnNumber: String(o.turn),
+    selfBalance: String(o.selfBalance),
+    opponentBalance: String(o.opponentBalance),
+    action: VFY_ACTION[o.actionType].toString(),
+    amount: String(o.amount),
+    circuitVersion: "1",
+    salt: "0",
+  };
+  const witness = await vfyWtnsBin(fields);
+  const wtnsPath = path.join("/tmp", `vfy-${o.matchId}-t${o.turn}.wtns`);
+  fs.writeFileSync(wtnsPath, Buffer.from(witness));
+  try {
+    const { proof, publicSignals } = await snarkjs.groth16.prove(VFY_ZKEY, wtnsPath);
+    return { proof, public_signals: publicSignals };
+  } finally {
+    try { fs.unlinkSync(wtnsPath); } catch (_) {}
+  }
+}
+
+// Steal strategy: EXTRACT min(10, opponentBalance) every turn; HOLD only
+// when the opponent is at 0. EXTRACT is free and dominates HOLD/FORTIFY
+// in every pairing (vs EXTRACT it nets 0, vs HOLD +10, vs FORTIFY +4).
+function stealDecide(state) {
+  const opp = BigInt(String(state.opponentBalance || "0"));
+  if (opp <= 0n) return { type: "HOLD" };
+  const amount = opp < 10n ? opp : 10n;
+  return { type: "EXTRACT", amount: amount.toString() };
+}
+
 const server = http.createServer((req, res) => {
   const started = Date.now();
   const chunks = [];
@@ -137,12 +303,57 @@ const server = http.createServer((req, res) => {
         console.log(`[${new Date().toISOString()}] preflight nonce=${env.nonce}`);
         return signResponse(res, { ok: true, protocolVersion: "v1" });
       }
+
+      // 3a. Steal the VFY turn (practice or competition).
+      if (env.eventId === "steal-the-vfy") {
+        const matchId = env.matchId || "";
+        const turn = env.turn ?? 0;
+        const state = env.state || {};
+        const commitment = (env.strategyCommitment && env.strategyCommitment.hash) || "0";
+        const action = stealDecide(state);
+        const amount = action.type === "EXTRACT" ? action.amount : "0";
+        let proof = null, public_signals = null;
+        try {
+          const r = await generateVfyProof({
+            commitment, matchId, turn,
+            selfBalance: state.selfBalance || "0",
+            opponentBalance: state.opponentBalance || "0",
+            actionType: action.type, amount,
+          });
+          proof = r.proof; public_signals = r.public_signals;
+        } catch (e) {
+          console.log(`[steal ${matchId} t${turn}] proof failed: ${e.message}`);
+        }
+        const outAction = action.type === "EXTRACT"
+          ? { type: "EXTRACT", amount: action.amount }
+          : { type: action.type };
+        const out = {
+          matchId, turn,
+          action: outAction,
+          policyProof: {
+            circuitVersion: "v1",
+            proof: proof || undefined,
+            public_signals: public_signals || undefined,
+            publicInputsHash: vfyPublicInputsHash({
+              commitment, matchId, turn,
+              selfBalance: state.selfBalance || "0",
+              opponentBalance: state.opponentBalance || "0",
+              actionType: action.type, amount,
+            }),
+          },
+          agentTimestamp: new Date().toISOString(),
+          idempotencyKey: `steal-vfy-${matchId}-turn-${turn}`,
+        };
+        console.log(`[${new Date().toISOString()}] steal ${matchId} t${turn} ${action.type} ${amount} ${Date.now() - started}ms proof=${!!proof} mode=${env.mode || "?"}`);
+        return signResponse(res, out);
+      }
+
       if (env.type !== "agent-games.proof-gatekeeper.v1") {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: "unknown type" }));
       }
 
-      // 3. Decide (fail closed; 50s internal budget inside the 60s deadline).
+      // 3b. Gatekeeper task (fail closed; 50s internal budget inside the 60s deadline).
       const input = env.input || {};
       const taskId = env.task_id || "";
       const { decision, reason_code } = decide(input);
@@ -169,4 +380,4 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => console.log(`gatekeeper agent listening on :${PORT}`));
+server.listen(PORT, () => console.log(`gatekeeper+steal agent listening on :${PORT}`));

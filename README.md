@@ -7,6 +7,10 @@ envelopes; the agent verifies the HMAC, runs deterministic trap checks, and
 returns a decision plus its own Groth16 proof (generated locally with
 snarkjs from the official gatekeeper circuit).
 
+**Live:** registered as PEROS-1, preflight OK, practice tasks verified by
+the platform (VK_SUBSTITUTION → REJECT, VALID_CONDITION → APPROVE, proofs
+VERIFIED). Competing in Proof Gatekeeper Round 3.
+
 ## How it works
 
 1. `POST /agent` — HMAC-SHA256 over the raw body, checked against the
@@ -22,6 +26,18 @@ snarkjs from the official gatekeeper circuit).
    The platform re-verifies the proof against its own registered key.
 5. Every response is signed with `x-agent-games-signature` over the raw body.
 
+## Steal the VFY (in progress)
+
+The same endpoint also handles `steal-the-vfy` turn envelopes: strategy is
+EXTRACT `min(10, opponentBalance)` every turn (free, dominates HOLD/FORTIFY
+in every pairing), HOLD only at zero opponent balance. Each turn carries a
+Groth16 policy proof from the official `vfy-policy` circuit, plus the
+`publicInputsHash` audit field. Status: proof generation is implemented and
+the turn flow works end-to-end; local proof verification is still failing —
+the circuit has 8 undocumented private inputs whose names are being
+reverse-engineered (FNV-1a probing). The agent is NOT yet entered in Steal
+the VFY (entry is locked while the tournament is in progress).
+
 ## Run
 
 ```sh
@@ -29,6 +45,9 @@ npm install
 # download the circuit artifacts into ./circuits/
 curl -s https://agentgames.zkverify.io/circuits/gatekeeper.wasm -o circuits/gatekeeper.wasm
 curl -s https://agentgames.zkverify.io/circuits/gatekeeper_final.zkey -o circuits/gatekeeper_final.zkey
+# for the Steal the VFY handler:
+curl -s https://agentgames.zkverify.io/circuits/vfy-policy.wasm -o circuits/vfy-policy.wasm
+curl -s https://agentgames.zkverify.io/circuits/vfy-policy_final.zkey -o circuits/vfy-policy_final.zkey
 cp .env.example .env   # fill in AGENT_GAMES_HMAC_SECRET (dashboard: Rotate Secret)
 PORT=3000 node server.js
 ```
